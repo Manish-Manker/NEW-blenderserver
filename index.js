@@ -1,3 +1,5 @@
+// stabel code for blender render server with queue  rendering
+
 const express = require('express');
 const fileUpload = require('express-fileupload');
 const cors = require('cors');
@@ -5,16 +7,21 @@ const { exec } = require('child_process');
 const path = require('path');
 const fs = require('fs');
 
+const PQueue = require('p-queue').default; 
+
 const app = express();
 const PORT = 3020;
 
 app.use(cors());
 app.use(fileUpload());
 
+// Create a queue with concurrency of 1 (one task at a time)
+const renderQueue = new PQueue({ concurrency: 1 });
+
 app.post('/render', async (req, res) => {
   const uploadDir = path.resolve(__dirname, 'uploads');
   const renderDir = path.resolve(__dirname, 'renders');
-  const textureDir = path.join(uploadDir, 'textures'); // Textures go here
+  const textureDir = path.join(uploadDir, 'textures');
   const timestamp = Date.now();
   const blendPath = path.join(uploadDir, `scene_${timestamp}.blend`);
   const outputPath = path.join(uploadDir, `render_${timestamp}.png`);
@@ -28,8 +35,8 @@ app.post('/render', async (req, res) => {
 
     const { blendFile, textureFile } = req.files || {};
 
-    if (!blendFile || !textureFile ) {
-      return res.status(400).send('Missing blendFile, textureFile  ->');
+    if (!blendFile || !textureFile) {
+      return res.status(400).send('Missing blendFile, textureFile');
     }
 
     if (!blendFile.name.endsWith('.blend')) {
@@ -43,6 +50,26 @@ app.post('/render', async (req, res) => {
     await blendFile.mv(blendPath);
     await textureFile.mv(path.join(textureDir, textureFile.name));
 
+    // Add the rendering task to the queue
+    renderQueue.add(async () => {
+      return await processRender(
+        blendPath,
+        path.join(textureDir, textureFile.name),
+        outputPath,
+        savedRenderPath,
+        scriptPath,
+        res
+      );
+    });
+  } catch (err) {
+    console.error('❌ Render error:', err);
+    res.status(500).json({ error: 'Render failed', details: err.message });
+  }
+});
+
+// Function to handle the rendering process
+async function processRender(blendPath, texturePath, outputPath, savedRenderPath, scriptPath, res) {
+  try {
     const blenderScript = `
 import bpy
 import os
@@ -86,12 +113,29 @@ def set_render_settings(output_path):
     try:
         scene = bpy.context.scene
         scene.render.engine = 'CYCLES'
-        scene.render.resolution_x = 1080
-        scene.render.resolution_y = 1080
+
+        # Enable GPU rendering
+        prefs = bpy.context.preferences.addons['cycles'].preferences
+        prefs.compute_device_type = 'CUDA'  # Use 'OPENCL' for AMD GPUs
+        prefs.get_devices()
+        for d in prefs.devices:
+            d.use = True
+        scene.cycles.device = 'GPU'
+
+        # Set render settings
+        scene.cycles.samples = 512
+        scene.cycles.use_denoising = True
+        scene.cycles.denoiser = 'OPENIMAGEDENOISE'
+        scene.cycles.use_adaptive_sampling = True
+
+        scene.render.resolution_x = 720
+        scene.render.resolution_y = 720
+        scene.render.resolution_percentage = 100
         scene.render.image_settings.file_format = 'PNG'
         scene.render.filepath = output_path
-        scene.cycles.samples = 1024
-        scene.cycles.use_denoising = True
+
+        scene.view_settings.view_transform = 'Filmic'
+        scene.view_settings.look = 'Medium High Contrast'
     except Exception as e:
         print(f"Error setting render settings: {e}")
 
@@ -105,7 +149,7 @@ def render_scene():
 def main():
     try:
         blend_path = r"${blendPath.replace(/\\/g, '\\\\')}"
-        texture_path = r"${path.join(textureDir, textureFile.name).replace(/\\/g, '\\\\')}"
+        texture_path = r"${texturePath.replace(/\\/g, '\\\\')}"
         mesh_name = "replacer"
 
         bpy.ops.wm.open_mainfile(filepath=blend_path)
@@ -154,16 +198,24 @@ main()
 
     fs.copyFileSync(outputPath, savedRenderPath);
 
-    res.sendFile(outputPath, (err) => {
-      [blendPath, scriptPath].forEach(p => { try { fs.unlinkSync(p); } catch {} });
-      if (err) console.error('Send error:', err);
+    res.sendFile(savedRenderPath, (err) => {
+      if (err) {
+        console.error('❌ Send error:', err);
+      }
     });
 
+    // Cleanup files
+    fs.unlinkSync(outputPath);
+    fs.unlinkSync(texturePath);
+    fs.unlinkSync(blendPath);
+    fs.unlinkSync(scriptPath);
+
+    console.log('✅ Render process completed and files cleaned up.');
   } catch (err) {
     console.error('❌ Render error:', err);
     res.status(500).json({ error: 'Render failed', details: err.message });
   }
-});
+}
 
 app.listen(PORT, () => {
   console.log(`✅ Render server running at http://localhost:${PORT}`);

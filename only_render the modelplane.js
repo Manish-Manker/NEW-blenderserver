@@ -54,7 +54,7 @@ def set_render_settings(output_path):
     scene = bpy.context.scene
     scene.render.engine = 'CYCLES'
     prefs = bpy.context.preferences.addons['cycles'].preferences
-    prefs.compute_device_type = 'CUDA'
+    prefs.compute_device_type = 'CUDA'  
     prefs.get_devices()
     for d in prefs.devices:
         d.use = True
